@@ -1,5 +1,11 @@
-data/
-.DS_Store
+_site
+.sass-cache
+.jekyll-cache
+.jekyll-metadata
+vendor
 .Rhistory
-notebooks/.Rhistory
+data/
+404.html
+Gemfile
+Gemfile.lock
 
