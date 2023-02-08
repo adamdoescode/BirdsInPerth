@@ -1,0 +1,496 @@
+
+---
+title: "Birds on Rottnest Data Analysis"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '4'
+    toc_float:
+      collapsed: no
+    theme: darkly
+    highlight: tango
+    df_print: paged
+    code_folding: hide
+---
+
+# Birds on Rottnest Island 
+
+Rottnest Island is a unique island off the coast of Perth. It is a popular tourist
+destination to see Quokkas and go snorkling.
+
+A number of annual surveys are carried out on Rottnest Island and some of that
+data is included in the dataset used in this notebook.
+
+```{r}
+suppressMessages(library(data.table))
+suppressMessages(library(tidyverse))
+suppressMessages(library(chron))
+suppressMessages(library(patchwork))
+#for maps
+library(ozmaps)
+library(sf)
+library(betareg)
+abs_ced <- ozmap_data("abs_ced")
+#useful for filtering for good surveys
+best_survey_types <- c("2ha, 20 minute search", "500m area search", "5km area search")
+```
+
+Read in data. In a separate script `extractRottnestData.R` I have extracted just the Rottnest Island observations to a csv. This allows us to quickly load them into this file, something that is particularly convenient when knitting the document to HTML.
+
+```{r}
+rotto_surveys <- fread("../data/rottnestObservations.csv")
+rotto_surveys %>% head()
+```
+
+We can group by survey point (this may group multiple surveys) to do a diagnostic plot confirming that our data is actually on Rottnest Island:
+
+```{r}
+uniqueSurveysByLocation <- rotto_surveys %>% 
+    group_by(`Survey Point ID`) %>% 
+    summarise(
+        Latitude = first(Latitude),
+        Longitude = first(Longitude),
+        surveyCount = n()
+    )
+
+#plot to check
+ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.4,115.6), ylim = c(-31.93,-32.05)) +
+	geom_point(
+		aes(Longitude, Latitude, colour = log(surveyCount)), 
+		data = uniqueSurveysByLocation
+	) +
+    ggtitle("diagnostic plot of all observations in Rottnest Dataset") +
+    theme_bw()
+```
+
+# data cleaning
+
+We can do some quick data cleaning to remove data where not all species were recorded or the survey is not marked complete:
+```{r}
+rottoClean <- rotto_surveys %>% 
+    filter(Completed == "Yes", `All Species Recorded` == "Yes")
+```
+
+# data features
+
+Not all surveys are equal! In this dataset we have several different types of surveys. Including some surveys that are unique to Rottnest Island.
+
+We can see in the `Source` column a hint at what type of survey has been done. We have a number of different "sources" here including eBird (another bird observation platform), old Atlas Records, "pelagic" trips (bird surveys done from boats), a long running project - "Perth Suburban Bird Project", and individual records from Birdata.
+
+```{r}
+rottoClean$Source %>% unique()
+```
+
+Within Birdata there are standardised survey types. We can see that our dataset 
+lists these and that different surveys have been done with very different 
+frequencies. By far the most common survey type is the "5 minute point search".
+
+```{r}
+rottoClean %>% group_by(`Survey Type`) %>% 
+    count() %>% arrange(desc(n))
+```
+
+Although not clearly labelled, a subset of this dataset is actually a bushbird 
+survey. We can label it as such and see how it impacts our results.
+
+To find these surveys we can look for the string "Rottnest" within the 
+`Source ref` variable.
+
+Repeating the same survey type table as above, we can see that only 49 of the 
+10,000 5 minute point surveys were not part of the bushbird surveys. This means
+we can expect the bush bird surveys to significantly skew the dataset.
+
+```{r}
+#add a variable marking the bushbird surveys
+rottoClean <- rottoClean %>% 
+    mutate(bushBirdSurveys = str_detect(`Source Ref`, "Rottnest"))
+#repeat the survey type table using the new variable
+rottoClean %>% group_by(`Survey Type`, bushBirdSurveys) %>% 
+    count() %>% arrange(desc(n))
+```
+
+To protect against bias, any analysis will require focusing on a specific
+type(s) of survey. Here, we are primarily interested in two high quality groups:
+
+1. the bushbird surveys
+
+2. standardised birdata app surveys
+
+"standardised birdata app surveys" mean those that are one of the following 
+types: "2ha, 20 minute search", "500m area search", "5km area search"
+
+We can create dataframes for each of these and then explore them.
+
+```{r}
+#bushbirds
+bushbirds <- rottoClean %>% 
+    filter(bushBirdSurveys)
+
+standardSurveys <- rottoClean %>% 
+    filter(`Survey Type` %in% best_survey_types)
+
+#adding a variable to our dataframe for this is helpful later
+rottoClean <- rottoClean %>% 
+    #make surveyGroup to use for groupBy
+    mutate(
+        surveyGroup = case_when(
+            bushBirdSurveys ~ "bushBirds",
+            `Survey Type` %in% best_survey_types ~ "standardSurveys",
+            .default = "other"
+        ))
+```
+
+# data exploration
+
+We can see that there are 160 unique species recorded in this dataset. 157 of 
+these are present in the standardised surveys while only 45 are present in the 
+bushbird surveys.
+
+```{r}
+rottoClean %>% 
+	group_by(`Scientific Name`) %>% 
+	summarise(n()) %>% dim()
+bushbirds %>% 
+	group_by(`Scientific Name`) %>% 
+	summarise(n()) %>% dim()
+standardSurveys %>% 
+	group_by(`Scientific Name`) %>% 
+	summarise(n()) %>% dim()
+```
+
+This reflects the locations covered by the bush bird and standardised surveys.
+
+Standardised surveys are done by individuals working by themselves or in small 
+groups. The bush bird surveys are conducted at specific locations designed to 
+capture sightings of bush birds on Rottnest Island.
+
+```{r}
+ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.4,115.6), ylim = c(-31.95,-32.05)) +
+    geom_point(
+		aes(Longitude, Latitude), 
+		data = standardSurveys,
+		color = "blue"
+	) +
+	geom_point(
+		aes(Longitude, Latitude), 
+		data = bushbirds,
+		color = "orange"
+	) +
+    ggtitle("Locations of surveys for bushbirds (yellow) and standardised surveys (blue)") +
+    theme_bw()
+```
+
+What species are seen most often? The table below returns the count of these species on Rottnest Island. We can see that this list is dominated by bush birds thanks to the large number of bush bird surveys. When we exclude this group and look at the standarised surveys and other surveys we see that water birds and waders become dominant.
+
+```{r}
+rotto_species_counts <- rottoClean %>% 
+	group_by(surveyGroup, `Common Name`, `Scientific Name`) %>% 
+	summarise(rotto_count=n()) %>% arrange(desc(rotto_count))
+rotto_species_counts %>% head()
+rotto_species_counts %>% filter(surveyGroup == "other") %>% head()
+rotto_species_counts %>% filter(surveyGroup == "standardSurveys") %>% head()
+```
+
+
+We can see that, for all surveys, there is a median of 4 species observed per survey. Excluding the bush bird surveys, we can see that other surveys and standardised surveys have higher medians.
+
+```{r}
+rottoClean %>% group_by(`Survey ID`) %>% 
+	summarise(n = n()) %>% 
+    summarise(
+        mean = mean(n),
+        median = median(n))
+rottoClean %>% group_by(surveyGroup, `Survey ID`) %>% 
+	summarise(n = n()) %>% 
+    group_by(surveyGroup) %>% 
+    summarise(
+        mean = mean(n),
+        median = median(n))
+```
+
+A density plot of each group of surveys illustrates the difference in species 
+counts that the above statistics were hinting at. Notably, very few standardised
+ surveys saw less than 5 species. This is due to the time spent doing the survey
+ is also standardised at at least 5 minutes.
+
+```{r}
+#create a summarised dataframe of counts by survey ID
+uniqueSpeciesRottoLocation <- rottoClean %>% 
+    group_by(`Survey ID`, surveyGroup) %>% 
+	summarise(
+	    n = n(),
+	    Latitude = first(Latitude), 
+	    Longitude = first(Longitude)
+	)
+#plot
+uniqueSpeciesRottoLocation %>% 
+	ggplot(aes(n, group = surveyGroup, colour = surveyGroup)) + 
+    geom_density() +
+    xlab("Number of unique species seen") +
+    theme_bw() +
+    ggtitle("Distribution of unique species seen in each survey")
+```
+
+
+# annual bushbird surveys
+
+Let's look closer at the bush bird surveys.
+
+In these surveys...
+
+Only last 3 years. Not much to go on.
+```{r}
+bushbirds <- bushbirds %>% 
+	mutate(Month = as.numeric(format(`Start Date`, "%m")),
+				 Year = as.numeric(format(`Start Date`, "%Y")))
+bushbirds$Year %>% unique()
+```
+
+We can see that some species were seen very frequently while others were seen 
+much less frequently.
+
+```{r}
+bushbirds %>% 
+	group_by(`Common Name`) %>% 
+	count() %>% 
+	arrange(desc(n)) %>% 
+	mutate(percent = (n/2547)*100) %>% 
+    head
+```
+
+## Observers vs species count? 
+
+No significant difference, but worth nothing that Year seems to correlate with number of observers?
+```{r}
+sep_obsv_vs_spec_counts <- bushbirds %>% group_by(`Survey ID`, `Number of Observers`, Year) %>% 
+	summarise(species_count = n())
+sep_obsv_vs_spec_counts %>% 
+	ggplot(aes(`Number of Observers`, species_count, group=`Number of Observers`)) + geom_boxplot()
+model.sep_obsv_vs_spec_counts <- glm(species_count ~ `Number of Observers`*Year, data = sep_obsv_vs_spec_counts)
+summary(model.sep_obsv_vs_spec_counts)
+```
+
+Year negatively correlated with number of observers. Looks like surveys in 2021 
+well all a single person. Which is consistent with what I observed when 
+participating in 2022.
+
+```{r}
+model.year.observers <- glm(`Number of Observers` ~ Year, data = sep_obsv_vs_spec_counts)
+summary(model.year.observers)
+sep_obsv_vs_spec_counts %>% 
+	group_by(Year, `Number of Observers`) %>% 
+	summarise(n=n())
+```
+
+# species observed
+
+As seen above, 45 species were observed. The most frequently observed were 
+Western Gerygones and Silvereyes.
+
+```{r}
+bushbirds %>% group_by(`Common Name`) %>% 
+	summarise(n=n()) %>% arrange(desc(n)) %>% 
+    head(5)
+```
+
+## by year?
+
+Species diversity at each survey site? Seems to differ based on location.
+
+```{r}
+sep_count_by_survey_point <- bushbirds %>% 
+	group_by(`Survey Point Name`,`Common Name`) %>% 
+	summarise(n = n(),Lon=mean(Longitude), Lat=mean(Latitude)) %>% 
+	group_by(Lon, Lat, `Survey Point Name`) %>% 
+	summarise(species_count = n())
+
+ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.44,115.57), ylim = c(-31.98,-32.03)) +
+	geom_point(
+		aes(Lon, Lat, colour = species_count), 
+		data = sep_count_by_survey_point,
+		alpha = 0.5
+	)
+```
+
+## survey point names
+
+I was previously curious about whether the numbering system for survey point 
+identifiers was following a pattern. I later learned that the original sites 
+did follow a pattern but that this pattern was not followed as points were 
+added later.
+
+Split out the number from "R" and plot by colour on map to try and observe a 
+pattern. As can be seen, there is a distinct pattern to the points where those 
+close together geographically tend to have similar numbers.
+
+I also explored whether the 10s position in the ID was important but a look at 
+the plot coloured by modulus 10 shows that the pattern is incidental and not 
+useful for determining location.
+
+```{r}
+sep_count_by_survey_point_name <- bushbirds %>% 
+	#make survey point name as number
+	mutate(
+	    Survey_point_number = str_remove(`Survey Point Name`,"R") %>% 
+	           as.numeric()
+	) %>% 
+	group_by(Survey_point_number,`Common Name`) %>% 
+	summarise(n = n(),Lon=mean(Longitude), Lat=mean(Latitude)) %>% 
+	group_by(Lon, Lat, Survey_point_number) %>% 
+	summarise(species_count = n())
+
+ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.44,115.57), ylim = c(-31.98,-32.03)) +
+	geom_point(
+		aes(Lon, Lat, colour = Survey_point_number), 
+		data = sep_count_by_survey_point_name,
+		alpha = 0.5
+	) + ggtitle("plot of survey points coloured by their identifying number")
+
+ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.44,115.57), ylim = c(-31.98,-32.03)) +
+	geom_point(
+		aes(Lon, Lat, colour = modulo_num), 
+		data = sep_count_by_survey_point_name %>% 
+		    mutate(modulo_num = Survey_point_number %/% 10 %>% as.factor()),
+		alpha = 0.5
+	) + 
+    ggtitle("plot of survey points coloured by the modulus of their identifying number")
+```
+
+Has every survey point done in all (3) years? No, a few points have only be done 
+once. These points are likely new points added in the past year.
+
+```{r}
+bushbirds %>% 
+	group_by(Year, `Survey Point Name`) %>% 
+	summarise(species_count=n()) %>% 
+	group_by(`Survey Point Name`) %>% 
+    summarise(n=n()) %>% 
+    filter(n!=3)
+```
+
+Below, is a series of plots showing the locations that Red capped robins were 
+seen over the 3 years of the surveys. While we can see that robins were seen at 
+most locations in all three years, some sites only observed them in one year or 
+another.
+
+```{r, fig.width=8, fig.height=12}
+RCP_2019 <- ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.45,115.56), ylim = c(-31.98,-32.04)) +
+	geom_point(
+		aes(Longitude, Latitude), 
+		data = bushbirds %>% filter(
+			`Common Name` == "Red-capped Robin",
+			Year == 2019
+		)
+	) + ggtitle("2019")
+RCP_2020 <- ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.45,115.56), ylim = c(-31.98,-32.04)) +
+	geom_point(
+		aes(Longitude, Latitude), 
+		data = bushbirds %>% filter(
+			`Common Name` == "Red-capped Robin",
+			Year == 2020
+		)
+	) + ggtitle("2020")
+RCP_2021 <- ggplot(abs_ced) + geom_sf() + 
+	coord_sf(xlim = c(115.45,115.56), ylim = c(-31.98,-32.04)) +
+	geom_point(
+		aes(Longitude, Latitude), 
+		data = bushbirds %>% filter(
+			`Common Name` == "Red-capped Robin",
+			Year == 2021
+		)
+	) + ggtitle("2021")
+
+RCP_2019/RCP_2020/RCP_2021
+```
+
+# Distance from observer for each species
+
+Part of the 5 minute survey involves recording the distance to the observed bird.
+
+This allows us to draw distributions of how far away a bird is typically observed.
+
+```{r}
+bushbirds_distance <- bushbirds %>% 
+	separate(`Sighting Notes`, sep = ",", into = as.character(1:8)) %>% 
+	pivot_longer(
+		as.character(1:7),
+		values_to = "Distance and count"
+	) %>% 
+	drop_na("Distance and count") %>% 
+	filter(`Distance and count`!= "") %>% 
+	separate(
+		"Distance and count",
+		sep = "=",
+		into = c("Distance", "count")
+	) %>% 
+	mutate(Distance = str_trim(Distance)) %>% 
+	mutate(
+		ordinal_distance = case_when(
+		  Distance == "0-5m" ~ 1,
+		  Distance == "5-10m" ~ 2,
+		  Distance == "10-15m" ~ 3,
+		  Distance == "15-20m" ~ 4,
+		  Distance == "20-30m" ~ 5,
+		  Distance == "30-40m" ~ 6,
+		  Distance == "40-50m" ~ 7,
+		  Distance == ">50m" ~ 8
+		)
+	) %>% 
+	drop_na(ordinal_distance)
+
+bushbirds_distance %>% 
+	select(c("Source Ref","Survey Point Name",`Common Name`,"Distance", ordinal_distance, "count"))
+```
+
+```{r}
+distance_labels = c("0-5m","5-10m","10-15m","15-20m","20-30m","30-40m","40-50m",">50m")
+species_of_interest = c(
+    "Red-capped Robin","Silvereye","Australian Magpie","Western Gerygone",
+    "Australian Raven","Sacred Kingfisher"
+)
+#all species
+bushbirds_distance %>% 
+	ggplot(aes(ordinal_distance)) +
+	geom_histogram(binwidth = 0.5) +
+	ggtitle("Distribution of observed distance for all species") +
+	scale_x_continuous(breaks = 1:8, labels = distance_labels) +
+	theme_bw()
+#specific species
+bushbirds_distance %>% 
+    filter(
+        `Common Name` %in% species_of_interest
+    ) %>% 
+	ggplot(aes(ordinal_distance)) +
+	geom_histogram(binwidth = 0.5) +
+    facet_wrap(vars(`Common Name`), scales = "free_y") +
+	ggtitle("Histogram of at least one individual observed at that distance per survey (all sites, all years)") +
+	scale_x_continuous(breaks = 1:8, labels = distance_labels) +
+	theme_bw() +
+    theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+
+```{r,fig.width=10, fig.height=10}
+over_100_bushbirds <- bushbirds_distance %>% 
+	group_by(`Common Name`) %>% count() %>% 
+	filter(n > 100) %>% 
+	pull(`Common Name`)
+bushbirds_distance %>% 
+	filter(`Common Name` %in% over_100_bushbirds) %>% 
+	ggplot(aes(ordinal_distance, `Common Name`, group = `Common Name`)) +
+	geom_boxplot() +
+	scale_x_continuous(breaks = 1:8, labels = distance_labels) +
+    ggtitle("Distribution of observed distance for various species")
+```
+
+
+
+
+
